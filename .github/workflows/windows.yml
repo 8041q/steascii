@@ -1,0 +1,69 @@
+name: Native Windows build
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure x64 Release
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test conversion, file loading and clipboard
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 30
+      - name: Check runtime dependencies and scan executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $tools = Get-ChildItem "$installation\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $dumpbin = Join-Path $tools.FullName 'bin\Hostx64\x64\dumpbin.exe'
+          $dependencies = & $dumpbin /DEPENDENTS build\Release\Steascii.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect executable dependencies.' }
+          $dependencies | Write-Output
+          # This app should import only these built-in Windows libraries.
+          $allowed = @('KERNEL32.dll', 'USER32.dll', 'GDI32.dll', 'COMDLG32.dll', 'COMCTL32.dll', 'ADVAPI32.dll', 'SHELL32.dll', 'OLE32.dll', 'OLEAUT32.dll', 'ucrtbase.dll')
+          $imports = @($dependencies | ForEach-Object {
+            if ($_ -match '^\s+([\w.-]+\.dll)\s*$') { $Matches[1] }
+          })
+          if ($imports.Count -eq 0) { throw 'No DLL imports were found; dependency verification failed.' }
+          foreach ($dll in $imports) {
+            if ($dll -notin $allowed -and $dll -notlike 'api-ms-win-*.dll' -and $dll -notlike 'ext-ms-win-*.dll') {
+              throw "Unexpected external runtime dependency: $dll"
+            }
+          }
+          # A clean scan is a check of this build, not a guarantee of future detections.
+          $platform = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform" -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+          $scanner = if ($platform) { Join-Path $platform.FullName 'MpCmdRun.exe' } else { "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" }
+          if (Test-Path $scanner) {
+            & $scanner -SignatureUpdate -MMPC
+            if ($LASTEXITCODE -ne 0) { throw "Could not update Defender definitions (exit $LASTEXITCODE)." }
+            & $scanner -Scan -ScanType 3 -File "$env:GITHUB_WORKSPACE\build\Release\Steascii.exe" -DisableRemediation
+            if ($LASTEXITCODE -ne 0) { throw "Defender scan failed or detected a threat (exit $LASTEXITCODE). Review the scan output." }
+          } else {
+            throw 'Microsoft Defender is unavailable on this runner; the executable was not scanned.'
+          }
+      - name: Package executable and checksum
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item build\Release\Steascii.exe package\Steascii.exe
+          $hash = (Get-FileHash package\Steascii.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Steascii.exe" | Set-Content package\SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Steascii-windows-x64
+          path: package/
+          if-no-files-found: error
